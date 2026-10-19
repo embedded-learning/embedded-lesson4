@@ -1,74 +1,53 @@
-#include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
-#include "driver/gpio.h"
-#include "esp_attr.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "freertos/task.h"
+#include "soc/adc_channel.h"
+#include "esp_err.h"
 
-#define BUTTON_PIN            GPIO_NUM_16
-#define PRESSED_LEVEL         0
-#define QUIET_WINDOW_MS       20
-#define LINE_CHECK_SAMPLES    1000
+#define ADC_CHANNEL ADC1_GPIO1_CHANNEL
 
-
-static volatile uint32_t edgeCount = 0;
-static volatile int64_t  firstEdgeUs = 0;
-static volatile int64_t  lastEdgeUs = 0;
-static TaskHandle_t      buttonTaskHandle = NULL;
-static void IRAM_ATTR handleButtonEdge(void *argument) {
-    int64_t nowUs = esp_timer_get_time();
-
-    if (edgeCount == 0) {
-        firstEdgeUs = nowUs;
-    }
-    lastEdgeUs = nowUs;
-    edgeCount++;
-
-    BaseType_t isHigherPriorityTaskWoken = pdFALSE;
-    vTaskNotifyGiveFromISR(buttonTaskHandle, &isHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(isHigherPriorityTaskWoken);
-}
-
-static void printLineRestCheck(gpio_num_t pin) {
-    uint32_t highCount = 0;
-    for (uint32_t sampleIndex = 0; sampleIndex < LINE_CHECK_SAMPLES; sampleIndex++) {
-        highCount += gpio_get_level(pin);
-    }
-    printf("LINE CHECK: %lu of %d reads are HIGH\n",
-           (unsigned long)highCount, LINE_CHECK_SAMPLES);
-}
-
-static void buttonEventTask(void *taskParameter) {
-    while (true) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        while (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(QUIET_WINDOW_MS)) != 0) {
-        }
-
-        uint32_t transitionCount  = edgeCount - 1;
-        int64_t  bounceDurationUs = lastEdgeUs - firstEdgeUs;
-        int      finalLevel       = gpio_get_level(BUTTON_PIN);
-        edgeCount = 0;
-
-        const char *eventName = finalLevel == PRESSED_LEVEL ? "PRESS" : "RELEASE";
-        printf("%s: transitions=%lu, pulses=%lu, bounce=%lld us\n",
-               eventName,
-               (unsigned long)transitionCount,
-               (unsigned long)(transitionCount / 2),
-               (long long)bounceDurationUs);
-    }
-}
+void errorHandler(esp_err_t status);
 
 void app_main(void) {
-    gpio_reset_pin(BUTTON_PIN);
-    gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BUTTON_PIN, GPIO_PULLUP_ONLY);
-    printLineRestCheck(BUTTON_PIN);
-    xTaskCreate(buttonEventTask, "BUTTON_EVENT", 4096, NULL, 10, &buttonTaskHandle);
+    adc_oneshot_unit_handle_t adcUnit;
+    adc_cali_handle_t adcHandle;
 
-    ESP_ERROR_CHECK(gpio_install_isr_service(0));
-    ESP_ERROR_CHECK(gpio_set_intr_type(BUTTON_PIN, GPIO_INTR_ANYEDGE));
-    ESP_ERROR_CHECK(gpio_isr_handler_add(BUTTON_PIN, handleButtonEdge, NULL));
+    adc_oneshot_unit_init_cfg_t unitConfig = {.unit_id = ADC_UNIT_1 };
+    adc_oneshot_chan_cfg_t channelConfig = { .atten=ADC_ATTEN_DB_12, .bitwidth=ADC_BITWIDTH_DEFAULT};
+    adc_cali_curve_fitting_config_t caliConfig = { .unit_id=unitConfig.unit_id, .atten=channelConfig.atten, .bitwidth=channelConfig.bitwidth};
+
+    ESP_ERROR_CHECK(adc_oneshot_new_unit( &unitConfig, &adcUnit));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adcUnit, ADC_CHANNEL, &channelConfig));
+    ESP_ERROR_CHECK(adc_cali_create_scheme_curve_fitting(&caliConfig, &adcHandle));
+
+    while (1) {
+        int outRaw;
+        int calibratedVoltage;
+
+        esp_err_t adcReadStatus =  adc_oneshot_read(adcUnit, ADC_CHANNEL, &outRaw);
+        esp_err_t adcCaliStatus = adc_cali_raw_to_voltage(adcHandle,outRaw, &calibratedVoltage);
+
+        if(adcReadStatus != ESP_OK ) {
+            errorHandler(adcReadStatus);
+            continue;
+        } else if (adcCaliStatus != ESP_OK) {
+            errorHandler(adcCaliStatus);
+            continue;
+        }
+        float convertedVoltageValue = (outRaw / 4095.0) * 3.1;
+        float fromMvtoV = calibratedVoltage / 1000.00;
+        float compareResult = (fromMvtoV - convertedVoltageValue) /  convertedVoltageValue * 100;
+        printf("ADC Value= %d, Voltage Value= %f, Calibrated Voltage = %.3f, Compre=%.1f %%\n", outRaw,convertedVoltageValue, fromMvtoV, compareResult);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
 }
+
+void errorHandler(esp_err_t status){
+    printf("%s\n", esp_err_to_name(status));
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
+
